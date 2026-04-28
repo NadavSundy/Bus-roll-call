@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import Fuse from 'fuse.js'
-import { supabase } from './lib/supabase'
+import { hasSupabaseConfig, supabase } from './lib/supabase'
 import type { Student } from './types'
 import BusSelector from './components/BusSelector'
 import StudentSearch from './components/StudentSearch'
@@ -19,11 +19,21 @@ function App() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
+  const ensureSupabaseConfig = (): boolean => {
+    if (hasSupabaseConfig) return true
+    setError(
+      'Missing Supabase config. Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY as environment variables during build.'
+    )
+    setLoading(false)
+    return false
+  }
+
   useEffect(() => {
     loadStudents()
   }, [])
 
   const loadStudents = async () => {
+    if (!ensureSupabaseConfig()) return
     setLoading(true)
     setError(null)
 
@@ -77,6 +87,7 @@ function App() {
   }, [searchQuery, fuse])
 
   const handleToggleStudent = async (studentId: number, checked: boolean) => {
+    if (!ensureSupabaseConfig()) return
     setLoading(true)
     setError(null)
 
@@ -113,6 +124,7 @@ function App() {
     name: string,
     options: { clearSearch?: boolean; checkedIn?: boolean; busNumber?: number } = {}
   ) => {
+    if (!ensureSupabaseConfig()) return
     const trimmed = name.trim()
     if (!trimmed) return
 
@@ -182,6 +194,7 @@ function App() {
   }
 
   const handleCsvUpload = async (file: File | null) => {
+    if (!ensureSupabaseConfig()) return
     if (!file) return
 
     const text = await file.text()
@@ -226,6 +239,8 @@ function App() {
   }
 
   const handleResetAttendance = async () => {
+    if (!ensureSupabaseConfig()) return
+
     const confirmed = window.confirm(
       'Reset attendance for everyone? This will mark all CSV-imported students as not checked in, clear any bus assignments, and remove manually added users.'
     )
