@@ -9,7 +9,7 @@ A mobile-friendly React app for school camp bus attendance. Students are tracked
 - Tick students off as present
 - Add new student names if not found
 - View combined summaries for checked-in, not checked-in, and manually added students
-- Built with React, Vite, TypeScript, and Supabase
+- Built with React, Vite, TypeScript, and Supabase.
 
 ## Setup
 
