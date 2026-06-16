@@ -86,15 +86,17 @@ For Gmail SMTP, Google requires 2-Step Verification and an App Password.
 
 In Supabase Auth URL Configuration:
 
-- Set Site URL to your production app URL.
+- Set Site URL to `https://nadavsundy.github.io/Bus-roll-call/`.
 - Add redirect URLs for production and local Vite dev:
-  - `https://your-production-app-url.com/**`
+  - `https://nadavsundy.github.io/Bus-roll-call/**`
+  - `https://nadavsundy.github.io/Bus-roll-call/`
   - `http://localhost:5173/**`
+  - `http://localhost:5173/`
 
 Set `VITE_APP_URL` in `.env` and in deployment environment variables. The app uses it for auth email redirects:
 
-- Account confirmation: `${VITE_APP_URL}/auth/callback`
-- Password reset: `${VITE_APP_URL}/auth/reset-password`
+- Account confirmation: `${VITE_APP_URL}/?auth=callback`
+- Password reset: `${VITE_APP_URL}/?auth=reset-password`
 
 ## Day-Of Use
 

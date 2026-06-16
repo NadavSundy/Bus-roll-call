@@ -77,13 +77,14 @@ function App() {
   const urlParams = useMemo(() => new URLSearchParams(window.location.search), [])
   const initialSessionId = urlParams.get('sessionId')
   const initialToken = urlParams.get('token')
+  const authRoute = urlParams.get('auth')
   const isPublicLink = Boolean(initialSessionId && initialToken)
-  const isResetPasswordPath = window.location.pathname === '/auth/reset-password'
+  const isResetPasswordRoute = authRoute === 'reset-password'
   const initialHelperName =
     isPublicLink && initialSessionId ? window.localStorage.getItem(`bus-role-call:${initialSessionId}:helper`) ?? '' : ''
 
   const [user, setUser] = useState<UserProfile | null>(null)
-  const [authMode, setAuthMode] = useState<AuthMode>(isResetPasswordPath ? 'set-new-password' : 'sign-in')
+  const [authMode, setAuthMode] = useState<AuthMode>(isResetPasswordRoute ? 'set-new-password' : 'sign-in')
   const [notice, setNotice] = useState<Notice>(null)
   const [confirmDialog, setConfirmDialog] = useState<ConfirmDialog>(null)
   const [loading, setLoading] = useState(false)

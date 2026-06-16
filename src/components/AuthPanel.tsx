@@ -1,5 +1,5 @@
 import { useState, type FC } from 'react'
-import { getAppUrl } from '../lib/appUrl'
+import { getAppUrl, getAuthCallbackUrl, getPasswordResetUrl } from '../lib/appUrl'
 import { supabase } from '../lib/supabase'
 import type { UserProfile } from '../types'
 
@@ -75,12 +75,11 @@ const AuthPanel: FC<AuthPanelProps> = ({ user, mode, onModeChange, onAuthChanged
       const passwordError = validatePassword()
       if (passwordError) throw new Error(passwordError)
 
-      const appUrl = getAppUrl()
       const { error: signUpError } = await supabase.auth.signUp({
         email: cleanEmail,
         password,
         options: {
-          emailRedirectTo: `${appUrl}/auth/callback`,
+          emailRedirectTo: getAuthCallbackUrl(),
         },
       })
 
@@ -109,9 +108,8 @@ const AuthPanel: FC<AuthPanelProps> = ({ user, mode, onModeChange, onAuthChanged
       const cleanEmail = email.trim()
       if (!cleanEmail) throw new Error('Enter your email address.')
 
-      const appUrl = getAppUrl()
       const { error: resetError } = await supabase.auth.resetPasswordForEmail(cleanEmail, {
-        redirectTo: `${appUrl}/auth/reset-password`,
+        redirectTo: getPasswordResetUrl(),
       })
 
       if (resetError) throw resetError
@@ -126,7 +124,7 @@ const AuthPanel: FC<AuthPanelProps> = ({ user, mode, onModeChange, onAuthChanged
       const { error: updateError } = await supabase.auth.updateUser({ password })
       if (updateError) throw updateError
 
-      window.history.replaceState(null, '', '/')
+      window.history.replaceState({}, '', `${getAppUrl()}/`)
       changeMode('sign-in')
       return 'Password updated. You can now continue.'
     })
