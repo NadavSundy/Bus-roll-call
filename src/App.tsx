@@ -1,483 +1,1295 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import Fuse from 'fuse.js'
 import { hasSupabaseConfig, supabase } from './lib/supabase'
-import type { Student } from './types'
-import BusSelector from './components/BusSelector'
-import StudentSearch from './components/StudentSearch'
-import AttendanceList from './components/AttendanceList'
-import SummaryView from './components/SummaryView'
+import { generateGroupCode } from './lib/groupCode'
+import type {
+  AttendanceRecord,
+  AttendanceSession,
+  Bus,
+  Group,
+  PublicCheckInResult,
+  PublicSessionPayload,
+  SessionStats,
+  Student,
+  UserProfile,
+  UUID,
+} from './types'
 import './App.css'
 
-const busNumbers = [1, 2, 3]
+type AdminTab = 'dashboard' | 'roster' | 'buses' | 'sessions'
+type Notice = { type: 'success' | 'error'; message: string } | null
+type ConfirmDialog = {
+  title: string
+  message: string
+  confirmLabel: string
+  danger?: boolean
+  onConfirm: () => void | Promise<void>
+} | null
+
+const POLL_INTERVAL_MS = 5000
+
+const normalizeName = (value: string) => value.trim().toLowerCase().replace(/\s+/g, ' ')
+
+const formatDateTime = (value: string | null | undefined) => {
+  if (!value) return 'Not set'
+  return new Date(value).toLocaleString()
+}
+
+const parseCsvNames = (csvText: string) => {
+  const rows = csvText
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+
+  const names = rows.map((row) => row.split(',')[0]?.replace(/^"|"$/g, '').trim() ?? '')
+  const withoutHeader = names[0]?.toLowerCase() === 'name' ? names.slice(1) : names
+  const seen = new Set<string>()
+
+  return withoutHeader.filter((name) => {
+    const normalized = normalizeName(name)
+    if (!normalized || seen.has(normalized)) return false
+    seen.add(normalized)
+    return true
+  })
+}
+
+const buildStats = (students: Student[], attendance: AttendanceRecord[]): SessionStats => {
+  const checkedIds = new Set(attendance.map((record) => record.student_id))
+  const registered = students.filter((student) => student.registered_for_programme)
+  const checkedInRegistered = registered.filter((student) => checkedIds.has(student.id)).length
+  const walkOnsCheckedIn = students.filter(
+    (student) => !student.registered_for_programme && checkedIds.has(student.id)
+  ).length
+
+  return {
+    totalRegistered: registered.length,
+    checkedInRegistered,
+    missingRegistered: registered.length - checkedInRegistered,
+    walkOnsCheckedIn,
+  }
+}
+
+const getRecordForStudent = (records: AttendanceRecord[], studentId: UUID) =>
+  records.find((record) => record.student_id === studentId) ?? null
 
 function App() {
-  const [page, setPage] = useState<'home' | 'manage' | 'search' | 'stats'>('home')
-  const [selectedBus, setSelectedBus] = useState(1)
-  const [students, setStudents] = useState<Student[]>([])
-  const [searchQuery, setSearchQuery] = useState('')
-  const [manualAddName, setManualAddName] = useState('')
+  const urlParams = useMemo(() => new URLSearchParams(window.location.search), [])
+  const initialSessionId = urlParams.get('sessionId')
+  const initialToken = urlParams.get('token')
+  const isPublicLink = Boolean(initialSessionId && initialToken)
+  const initialHelperName =
+    isPublicLink && initialSessionId ? window.localStorage.getItem(`bus-role-call:${initialSessionId}:helper`) ?? '' : ''
+
+  const [user, setUser] = useState<UserProfile | null>(null)
+  const [authEmail, setAuthEmail] = useState('')
+  const [notice, setNotice] = useState<Notice>(null)
+  const [confirmDialog, setConfirmDialog] = useState<ConfirmDialog>(null)
   const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  const [adminTab, setAdminTab] = useState<AdminTab>('dashboard')
 
-  const ensureSupabaseConfig = (): boolean => {
-    if (hasSupabaseConfig) return true
-    setError(
-      'Missing Supabase config. Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY as environment variables during build.'
-    )
-    setLoading(false)
-    return false
-  }
+  const [groups, setGroups] = useState<Group[]>([])
+  const [selectedGroupId, setSelectedGroupId] = useState<UUID | null>(null)
+  const [buses, setBuses] = useState<Bus[]>([])
+  const [students, setStudents] = useState<Student[]>([])
+  const [sessions, setSessions] = useState<AttendanceSession[]>([])
+  const [records, setRecords] = useState<AttendanceRecord[]>([])
+  const [selectedSessionId, setSelectedSessionId] = useState<UUID | null>(null)
 
-  useEffect(() => {
-    loadStudents()
+  const [newGroupName, setNewGroupName] = useState('')
+  const [newStudentName, setNewStudentName] = useState('')
+  const [newStudentRegistered, setNewStudentRegistered] = useState(true)
+  const [newBusLabel, setNewBusLabel] = useState('')
+  const [newSessionName, setNewSessionName] = useState('Departure')
+
+  const [publicPayload, setPublicPayload] = useState<PublicSessionPayload | null>(null)
+  const [publicLoading, setPublicLoading] = useState(false)
+  const [helperNameDraft, setHelperNameDraft] = useState(initialHelperName)
+  const [helperName, setHelperName] = useState(initialHelperName)
+  const [selectedPublicBusId, setSelectedPublicBusId] = useState<UUID | ''>('')
+  const [publicBusFilterId, setPublicBusFilterId] = useState<UUID | 'all'>('all')
+  const [publicSearch, setPublicSearch] = useState('')
+  const [walkOnName, setWalkOnName] = useState('')
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
+  const [pendingOverride, setPendingOverride] = useState<{
+    studentId: UUID
+    busId: UUID
+    conflict: PublicCheckInResult
+  } | null>(null)
+
+  const selectedGroup = groups.find((group) => group.id === selectedGroupId) ?? null
+  const selectedSession = sessions.find((session) => session.id === selectedSessionId) ?? null
+  const activeSession = sessions.find((session) => session.status === 'open') ?? null
+  const activeOrSelectedSession = selectedSession ?? activeSession
+  const adminStats = useMemo(() => buildStats(students, records), [students, records])
+
+  const publicStats = useMemo(
+    () => buildStats(publicPayload?.students ?? [], publicPayload?.attendance ?? []),
+    [publicPayload]
+  )
+
+  const publicRecordsByStudent = useMemo(() => {
+    const map = new Map<UUID, AttendanceRecord>()
+    publicPayload?.attendance.forEach((record) => map.set(record.student_id, record))
+    return map
+  }, [publicPayload])
+
+  const publicFuse = useMemo(() => {
+    return new Fuse(publicPayload?.students ?? [], {
+      keys: ['name'],
+      threshold: 0.35,
+      ignoreLocation: true,
+    })
+  }, [publicPayload])
+
+  const publicVisibleStudents = useMemo(() => {
+    const source = publicSearch.trim()
+      ? publicFuse.search(publicSearch.trim()).map((result) => result.item)
+      : publicPayload?.students ?? []
+
+    if (publicBusFilterId === 'all') return source
+
+    return source.filter((student) => publicRecordsByStudent.get(student.id)?.bus_id === publicBusFilterId)
+  }, [publicBusFilterId, publicFuse, publicPayload, publicRecordsByStudent, publicSearch])
+
+  const showNotice = useCallback((type: 'success' | 'error', message: string) => {
+    setNotice({ type, message })
   }, [])
 
-  const loadStudents = async () => {
+  const ensureSupabaseConfig = useCallback(() => {
+    if (hasSupabaseConfig) return true
+    showNotice('error', 'Missing Supabase config. Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY.')
+    return false
+  }, [showNotice])
+
+  const loadAuth = useCallback(async () => {
     if (!ensureSupabaseConfig()) return
-    setLoading(true)
-    setError(null)
-
-    const response = await supabase
-      .from('students')
-      .select('*')
-      .order('name', { ascending: true })
-
-    if (response.error) {
-      setError(response.error.message)
-      setStudents([])
-    } else {
-      setStudents((response.data as Student[]) ?? [])
+    const { data, error } = await supabase.auth.getSession()
+    if (error) {
+      showNotice('error', error.message)
+      return
     }
 
-    setLoading(false)
-  }
+    const profile = data.session?.user
+    setUser(profile ? { id: profile.id, email: profile.email ?? null } : null)
+  }, [ensureSupabaseConfig, showNotice])
 
-  const pendingStudents = useMemo(
-    () => students.filter((student) => !student.checked_in),
-    [students]
-  )
+  const loadGroups = useCallback(async () => {
+    if (!ensureSupabaseConfig() || !user) return
+    const { data, error } = await supabase.from('groups').select('*').order('created_at', { ascending: false })
+    if (error) {
+      showNotice('error', error.message)
+      setGroups([])
+      return
+    }
 
-  const summaryCheckedIn = useMemo(
-    () => students.filter((student) => student.checked_in),
-    [students]
-  )
-  const summaryNotCheckedIn = useMemo(
-    () => students.filter((student) => !student.checked_in),
-    [students]
-  )
-  const summaryAdded = useMemo(
-    () => students.filter((student) => student.is_added_manually),
-    [students]
-  )
+    const groupData = (data ?? []) as Group[]
+    setGroups(groupData)
+    setSelectedGroupId((current) => current ?? groupData[0]?.id ?? null)
+  }, [ensureSupabaseConfig, showNotice, user])
 
-  const fuse = useMemo(
-    () =>
-      new Fuse(pendingStudents, {
-        keys: ['name'],
-        threshold: 0.35,
-        ignoreLocation: true,
-      }),
-    [pendingStudents]
-  )
+  const loadAdminData = useCallback(async () => {
+    if (!ensureSupabaseConfig() || !selectedGroupId) return
 
-  const suggestions = useMemo(() => {
-    const trimmed = searchQuery.trim()
-    if (!trimmed) return []
-    return fuse.search(trimmed).map((result) => result.item).slice(0, 8)
-  }, [searchQuery, fuse])
+    const [busResponse, studentResponse, sessionResponse] = await Promise.all([
+      supabase.from('buses').select('*').eq('group_id', selectedGroupId).order('sort_order').order('label'),
+      supabase.from('students').select('*').eq('group_id', selectedGroupId).order('name'),
+      supabase
+        .from('attendance_sessions')
+        .select('*')
+        .eq('group_id', selectedGroupId)
+        .order('started_at', { ascending: false }),
+    ])
 
-  const handleToggleStudent = async (studentId: number, checked: boolean) => {
-    if (!ensureSupabaseConfig()) return
-    setLoading(true)
-    setError(null)
-
-    const response = await supabase
-      .from('students')
-      .update({
-        checked_in: checked,
-        bus_number: checked ? selectedBus : null,
-      })
-      .eq('id', studentId)
-      .select()
-      .single()
-
-    if (response.error) {
-      setError(response.error.message)
-    } else if (response.data) {
-      const updatedStudent = response.data as Student
-      setStudents((current) =>
-        current.map((student) => (student.id === updatedStudent.id ? updatedStudent : student))
+    if (busResponse.error || studentResponse.error || sessionResponse.error) {
+      showNotice(
+        'error',
+        busResponse.error?.message ?? studentResponse.error?.message ?? sessionResponse.error?.message ?? 'Load failed'
       )
+      return
     }
 
-    setLoading(false)
-  }
+    const sessionData = (sessionResponse.data ?? []) as AttendanceSession[]
+    setBuses((busResponse.data ?? []) as Bus[])
+    setStudents((studentResponse.data ?? []) as Student[])
+    setSessions(sessionData)
+    setSelectedSessionId((current) => {
+      if (current && sessionData.some((session) => session.id === current)) return current
+      return sessionData.find((session) => session.status === 'open')?.id ?? sessionData[0]?.id ?? null
+    })
+  }, [ensureSupabaseConfig, selectedGroupId, showNotice])
 
-  const handleSelectSuggestion = async (student: Student) => {
-    if (!student.checked_in) {
-      await handleToggleStudent(student.id, true)
-    }
-    setSearchQuery('')
-  }
-
-  const handleManualAddStudent = async (
-    name: string,
-    options: { clearSearch?: boolean; checkedIn?: boolean; busNumber?: number } = {}
-  ) => {
-    if (!ensureSupabaseConfig()) return
-    const trimmed = name.trim()
-    if (!trimmed) return
-
-    setLoading(true)
-    setError(null)
-
-    const response = await supabase
-      .from('students')
-      .insert([
-        {
-          name: trimmed,
-          checked_in: options.checkedIn ?? false,
-          bus_number: options.checkedIn ? options.busNumber ?? selectedBus : null,
-          is_added_manually: true,
-        },
-      ])
-      .select()
-      .single()
-
-    if (response.error) {
-      setError(response.error.message)
-    } else if (response.data) {
-      setStudents((current) => [...current, response.data as Student])
-      setManualAddName('')
-      if (options.clearSearch) {
-        setSearchQuery('')
-      }
+  const loadAdminRecords = useCallback(async () => {
+    if (!ensureSupabaseConfig() || !selectedSessionId) {
+      setRecords([])
+      return
     }
 
-    setLoading(false)
-  }
+    const { data, error } = await supabase
+      .from('attendance_records')
+      .select('*')
+      .eq('session_id', selectedSessionId)
+      .order('checked_in_at', { ascending: false })
 
-  const canAddNewStudent = useMemo(() => {
-    const trimmed = searchQuery.trim()
-    if (!trimmed) return false
-    return !students.some(
-      (student) => student.name.toLowerCase() === trimmed.toLowerCase()
-    )
-  }, [searchQuery, students])
-
-  const parseCsvText = (csvText: string) => {
-    const rows = csvText
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter(Boolean)
-
-    if (rows.length === 0) {
-      return []
+    if (error) {
+      showNotice('error', error.message)
+      setRecords([])
+      return
     }
 
-    const names = rows.map((row) => {
-      const firstColumn = row.split(',')[0].trim()
-      const cleaned = firstColumn.replace(/^"|"$/g, '').trim()
-      return cleaned
+    setRecords((data ?? []) as AttendanceRecord[])
+  }, [ensureSupabaseConfig, selectedSessionId, showNotice])
+
+  const refreshPublicSession = useCallback(async (quiet = false) => {
+    if (!ensureSupabaseConfig() || !initialSessionId || !initialToken) return
+    if (!quiet) setPublicLoading(true)
+
+    const { data, error } = await supabase.rpc('public_get_session_for_checkin', {
+      session_id: initialSessionId,
+      public_checkin_token: initialToken,
     })
 
-    const maybeHeader = names[0]?.toLowerCase()
-    const filteredNames = maybeHeader === 'name' ? names.slice(1) : names
+    if (error) {
+      showNotice('error', error.message)
+    } else {
+      const payload = data as PublicSessionPayload
+      setPublicPayload(payload)
+      setLastUpdated(new Date())
+      const storedBus = window.localStorage.getItem(`bus-role-call:${payload.session.id}:bus`)
+      if (storedBus && !selectedPublicBusId) setSelectedPublicBusId(storedBus)
+    }
 
-    return Array.from(
-      new Set(
-        filteredNames
-          .map((name) => name.trim())
-          .filter((name) => name.length > 0)
+    setPublicLoading(false)
+  }, [ensureSupabaseConfig, initialSessionId, initialToken, selectedPublicBusId, showNotice])
+
+  useEffect(() => {
+    void Promise.resolve().then(loadAuth)
+
+    const { data } = supabase.auth.onAuthStateChange((_event, session) => {
+      const profile = session?.user
+      setUser(profile ? { id: profile.id, email: profile.email ?? null } : null)
+    })
+
+    return () => data.subscription.unsubscribe()
+  }, [loadAuth])
+
+  useEffect(() => {
+    if (user) void Promise.resolve().then(loadGroups)
+  }, [loadGroups, user])
+
+  useEffect(() => {
+    void Promise.resolve().then(loadAdminData)
+  }, [loadAdminData])
+
+  useEffect(() => {
+    void Promise.resolve().then(loadAdminRecords)
+  }, [loadAdminRecords])
+
+  useEffect(() => {
+    if (!isPublicLink) return
+    void Promise.resolve().then(() => refreshPublicSession())
+  }, [initialSessionId, isPublicLink, refreshPublicSession])
+
+  useEffect(() => {
+    if (!isPublicLink) return
+    const interval = window.setInterval(() => {
+      void refreshPublicSession(true)
+    }, POLL_INTERVAL_MS)
+    return () => window.clearInterval(interval)
+  }, [isPublicLink, refreshPublicSession])
+
+  useEffect(() => {
+    if (!user || !selectedGroupId) return
+    const channel = supabase
+      .channel(`admin-refresh-${selectedGroupId}-${selectedSessionId ?? 'none'}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'buses', filter: `group_id=eq.${selectedGroupId}` }, () => {
+        void loadAdminData()
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'students', filter: `group_id=eq.${selectedGroupId}` }, () => {
+        void loadAdminData()
+      })
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'attendance_sessions', filter: `group_id=eq.${selectedGroupId}` },
+        () => {
+          void loadAdminData()
+        }
       )
-    )
-  }
 
-  const handleCsvUpload = async (file: File | null) => {
+    if (selectedSessionId) {
+      channel.on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'attendance_records', filter: `session_id=eq.${selectedSessionId}` },
+        () => {
+          void loadAdminRecords()
+        }
+      )
+    }
+
+    channel.subscribe()
+    return () => {
+      void supabase.removeChannel(channel)
+    }
+  }, [loadAdminData, loadAdminRecords, selectedGroupId, selectedSessionId, user])
+
+  const signIn = async () => {
     if (!ensureSupabaseConfig()) return
-    if (!file) return
-
-    const text = await file.text()
-    const names = parseCsvText(text)
-    if (names.length === 0) {
-      setError('No valid student names found in CSV.')
+    const email = authEmail.trim()
+    if (!email) {
+      showNotice('error', 'Enter your email address.')
       return
     }
 
-    const existingNames = new Set(students.map((student) => student.name.toLowerCase()))
-    const newNames = names.filter(
-      (name) => !existingNames.has(name.toLowerCase())
-    )
+    setLoading(true)
+    const { error } = await supabase.auth.signInWithOtp({ email })
+    setLoading(false)
+    if (error) showNotice('error', error.message)
+    else showNotice('success', 'Check your inbox for the magic link.')
+  }
+
+  const signOut = async () => {
+    await supabase.auth.signOut()
+    setUser(null)
+    setGroups([])
+    setSelectedGroupId(null)
+  }
+
+  const createGroup = async () => {
+    if (!ensureSupabaseConfig() || !user) return
+    const name = newGroupName.trim()
+    if (!name) return
+
+    setLoading(true)
+    const { data, error } = await supabase
+      .from('groups')
+      .insert({ name, group_code: generateGroupCode(), owner_id: user.id })
+      .select()
+      .single()
+    setLoading(false)
+
+    if (error) {
+      showNotice('error', error.message)
+      return
+    }
+
+    const group = data as Group
+    setNewGroupName('')
+    setGroups((current) => [group, ...current])
+    setSelectedGroupId(group.id)
+    showNotice('success', 'Programme created.')
+  }
+
+  const addStudent = async () => {
+    if (!ensureSupabaseConfig() || !selectedGroupId) return
+    const name = newStudentName.trim()
+    if (!name) return
+
+    setLoading(true)
+    const { error } = await supabase.from('students').insert({
+      group_id: selectedGroupId,
+      name,
+      normalized_name: normalizeName(name),
+      registered_for_programme: newStudentRegistered,
+      created_by: user?.id ?? null,
+    })
+    setLoading(false)
+
+    if (error) showNotice('error', error.message)
+    else {
+      setNewStudentName('')
+      showNotice('success', 'Student added.')
+      void loadAdminData()
+    }
+  }
+
+  const importCsv = async (file: File | null) => {
+    if (!ensureSupabaseConfig() || !selectedGroupId || !file) return
+    const names = parseCsvNames(await file.text())
+    const existing = new Set(students.map((student) => student.normalized_name))
+    const newNames = names.filter((name) => !existing.has(normalizeName(name)))
 
     if (newNames.length === 0) {
-      setError('All CSV names already exist in the roster.')
+      showNotice('error', 'No new names found. Duplicate roster names were skipped.')
       return
     }
 
     setLoading(true)
-    setError(null)
-
-    const response = await supabase
-      .from('students')
-      .insert(
-        newNames.map((name) => ({
-          name,
-          checked_in: false,
-          bus_number: null,
-          is_added_manually: false,
-        }))
-      )
-      .select()
-
-    if (response.error) {
-      setError(response.error.message)
-    } else if (response.data) {
-      setStudents((current) => [...current, ...(response.data as Student[])])
-    }
-
-    setLoading(false)
-  }
-
-  const handleResetAttendance = async () => {
-    if (!ensureSupabaseConfig()) return
-
-    const confirmed = window.confirm(
-      'Reset attendance for everyone? This will mark all CSV-imported students as not checked in, clear any bus assignments, and remove manually added users.'
+    const { error } = await supabase.from('students').insert(
+      newNames.map((name) => ({
+        group_id: selectedGroupId,
+        name,
+        normalized_name: normalizeName(name),
+        registered_for_programme: true,
+        imported_at: new Date().toISOString(),
+        imported_by: user?.id ?? null,
+      }))
     )
+    setLoading(false)
 
-    if (!confirmed) return
+    if (error) showNotice('error', error.message)
+    else {
+      showNotice('success', `Imported ${newNames.length} students. Skipped ${names.length - newNames.length} duplicates.`)
+      void loadAdminData()
+    }
+  }
 
-    setLoading(true)
-    setError(null)
+  const removeStudent = (student: Student) => {
+    setConfirmDialog({
+      title: 'Remove student?',
+      message: `Remove ${student.name} from this programme roster?`,
+      confirmLabel: 'Remove',
+      danger: true,
+      onConfirm: async () => {
+        const { error } = await supabase.from('students').delete().eq('id', student.id)
+        if (error) showNotice('error', error.message)
+        else {
+          showNotice('success', 'Student removed.')
+          void loadAdminData()
+        }
+      },
+    })
+  }
 
-    const deleteResponse = await supabase
-      .from('students')
-      .delete()
-      .eq('is_added_manually', true)
+  const addBus = async () => {
+    if (!ensureSupabaseConfig() || !selectedGroupId) return
+    const label = newBusLabel.trim()
+    if (!label) return
 
-    if (deleteResponse.error) {
-      setError(deleteResponse.error.message)
-      setLoading(false)
+    const { error } = await supabase.from('buses').insert({
+      group_id: selectedGroupId,
+      label,
+      sort_order: buses.length + 1,
+      active: true,
+    })
+
+    if (error) showNotice('error', error.message)
+    else {
+      setNewBusLabel('')
+      showNotice('success', 'Bus added.')
+      void loadAdminData()
+    }
+  }
+
+  const toggleBusActive = async (bus: Bus) => {
+    const { error } = await supabase.from('buses').update({ active: !bus.active }).eq('id', bus.id)
+    if (error) showNotice('error', error.message)
+    else {
+      showNotice('success', bus.active ? 'Bus deactivated.' : 'Bus reactivated.')
+      void loadAdminData()
+    }
+  }
+
+  const deleteOrDeactivateBus = async (bus: Bus) => {
+    const { count, error: countError } = await supabase
+      .from('attendance_records')
+      .select('id', { count: 'exact', head: true })
+      .eq('bus_id', bus.id)
+
+    if (countError) {
+      showNotice('error', countError.message)
       return
     }
 
-    const resetResponse = await supabase
-      .from('students')
-      .update({ checked_in: false, bus_number: null })
-      .eq('is_added_manually', false)
-      .select()
-
-    if (resetResponse.error) {
-      setError(resetResponse.error.message)
-    } else if (resetResponse.data) {
-      setStudents(resetResponse.data as Student[])
+    if ((count ?? 0) > 0) {
+      await supabase.from('buses').update({ active: false }).eq('id', bus.id)
+      showNotice('success', 'Bus has attendance history, so it was deactivated.')
+    } else {
+      await supabase.from('buses').delete().eq('id', bus.id)
+      showNotice('success', 'Unused bus deleted.')
     }
-
-    setLoading(false)
+    void loadAdminData()
   }
 
-  return (
-    <div className="app-shell">
-      <header className="hero-card">
-        <div className="hero-copy-block">
-          <p className="eyebrow">Camp Bus Role Call</p>
-          <h1>Track student boarding across bus 1–3</h1>
-          <p className="hero-description">
-            Search names with fuzzy suggestions, tick students off as they board,
-            or add new riders directly to the current bus.
-          </p>
-        </div>
+  const startSession = async () => {
+    if (!ensureSupabaseConfig() || !selectedGroupId || !user) return
+    const name = newSessionName.trim()
+    if (!name) return
 
-        <div className="hero-stats">
-          <div className="stat-card">
-            <span className="stat-label">All students</span>
-            <strong className="stat-value">{students.length}</strong>
-          </div>
-          <div className="stat-card">
-            <span className="stat-label">Checked in</span>
-            <strong className="stat-value">{summaryCheckedIn.length}</strong>
-          </div>
-          <div className="stat-card">
-            <span className="stat-label">Added users</span>
-            <strong className="stat-value">{summaryAdded.length}</strong>
-          </div>
-        </div>
-      </header>
+    const { data, error } = await supabase
+      .from('attendance_sessions')
+      .insert({ group_id: selectedGroupId, name, created_by: user.id })
+      .select()
+      .single()
 
-      <div className="page-nav-wrapper">
-        <div className="page-nav">
-          <button type="button" className={page === 'home' ? 'nav-active' : ''} onClick={() => setPage('home')}>
-            Home
-          </button>
-          <button type="button" className={page === 'manage' ? 'nav-active' : ''} onClick={() => setPage('manage')}>
-            Add / Reset
-          </button>
-          <button type="button" className={page === 'search' ? 'nav-active' : ''} onClick={() => setPage('search')}>
-            Search / Tick
-          </button>
-          <button type="button" className={page === 'stats' ? 'nav-active' : ''} onClick={() => setPage('stats')}>
-            Stats
-          </button>
-        </div>
-        {page !== 'home' ? (
-          <div className="page-back">
-            <button type="button" onClick={() => setPage('home')}>
-              ← Back to home
+    if (error) {
+      showNotice('error', error.message)
+      return
+    }
+
+    const session = data as AttendanceSession
+    setSelectedSessionId(session.id)
+    showNotice('success', 'Attendance session started.')
+    void loadAdminData()
+  }
+
+  const resetSession = () => {
+    if (!activeOrSelectedSession || activeOrSelectedSession.status !== 'open') return
+    setConfirmDialog({
+      title: 'Reset this open session?',
+      message: 'This clears attendance records only for the selected open session. The roster and closed sessions stay unchanged.',
+      confirmLabel: 'Reset attendance',
+      danger: true,
+      onConfirm: async () => {
+        const { error } = await supabase.rpc('admin_reset_open_session', { session_id: activeOrSelectedSession.id })
+        if (error) showNotice('error', error.message)
+        else {
+          showNotice('success', 'Open session attendance reset.')
+          void loadAdminRecords()
+        }
+      },
+    })
+  }
+
+  const endSession = () => {
+    if (!activeOrSelectedSession || activeOrSelectedSession.status !== 'open') return
+    setConfirmDialog({
+      title: 'End session?',
+      message: 'This locks the session as read-only. Helpers will only see the summary after it is closed.',
+      confirmLabel: 'End session',
+      danger: true,
+      onConfirm: async () => {
+        const { error } = await supabase.rpc('admin_end_session', { session_id: activeOrSelectedSession.id })
+        if (error) showNotice('error', error.message)
+        else {
+          showNotice('success', 'Session closed.')
+          void loadAdminData()
+        }
+      },
+    })
+  }
+
+  const publicCheckIn = async (studentId: UUID, overrideExisting = false) => {
+    if (!initialSessionId || !initialToken || !selectedPublicBusId) {
+      showNotice('error', 'Choose a bus before checking students in.')
+      return
+    }
+
+    const { data, error } = await supabase.rpc('public_check_in_student', {
+      session_id: initialSessionId,
+      public_checkin_token: initialToken,
+      student_id: studentId,
+      bus_id: selectedPublicBusId,
+      helper_name: helperName,
+      override_existing: overrideExisting,
+    })
+
+    if (error) {
+      showNotice('error', error.message)
+      return
+    }
+
+    const result = data as PublicCheckInResult
+    if (result.status === 'conflict') {
+      setPendingOverride({ studentId, busId: selectedPublicBusId, conflict: result })
+      return
+    }
+
+    showNotice('success', result.status === 'move' ? 'Student moved to selected bus.' : 'Student checked in.')
+    setPublicSearch('')
+    await refreshPublicSession(true)
+  }
+
+  const publicCheckOut = async (studentId: UUID) => {
+    if (!initialSessionId || !initialToken) return
+    const { error } = await supabase.rpc('public_check_out_student', {
+      session_id: initialSessionId,
+      public_checkin_token: initialToken,
+      student_id: studentId,
+      helper_name: helperName,
+    })
+
+    if (error) showNotice('error', error.message)
+    else {
+      showNotice('success', 'Check-in undone.')
+      await refreshPublicSession(true)
+    }
+  }
+
+  const addWalkOn = async () => {
+    if (!initialSessionId || !initialToken || !selectedPublicBusId) {
+      showNotice('error', 'Choose a bus before adding a walk-on.')
+      return
+    }
+
+    const { error } = await supabase.rpc('public_add_walk_on_student', {
+      session_id: initialSessionId,
+      public_checkin_token: initialToken,
+      name: walkOnName,
+      bus_id: selectedPublicBusId,
+      helper_name: helperName,
+    })
+
+    if (error) showNotice('error', error.message)
+    else {
+      setWalkOnName('')
+      showNotice('success', 'Walk-on added and checked in.')
+      await refreshPublicSession(true)
+    }
+  }
+
+  const saveHelperName = () => {
+    const cleanName = helperNameDraft.trim()
+    if (!cleanName || !publicPayload) return
+    window.localStorage.setItem(`bus-role-call:${publicPayload.session.id}:helper`, cleanName)
+    setHelperName(cleanName)
+  }
+
+  const setPublicBus = (busId: UUID) => {
+    setSelectedPublicBusId(busId)
+    if (publicPayload) window.localStorage.setItem(`bus-role-call:${publicPayload.session.id}:bus`, busId)
+  }
+
+  const copySessionLink = async (session: AttendanceSession) => {
+    if (!session.public_checkin_token) {
+      showNotice('error', 'This session does not expose a public token in the current query.')
+      return
+    }
+
+    const link = `${window.location.origin}${window.location.pathname}?sessionId=${session.id}&token=${session.public_checkin_token}`
+    await navigator.clipboard.writeText(link)
+    showNotice('success', 'Public check-in link copied.')
+  }
+
+  const copyWhatsAppSummary = async () => {
+    if (!selectedGroup || !activeOrSelectedSession) return
+    const lines = buildSummaryLines(selectedGroup.name, activeOrSelectedSession, buses, students, records)
+    await navigator.clipboard.writeText(lines.join('\n'))
+    showNotice('success', 'WhatsApp summary copied.')
+  }
+
+  const downloadCsv = () => {
+    if (!activeOrSelectedSession) return
+    const checkedByStudent = new Map(records.map((record) => [record.student_id, record]))
+    const rows = [
+      ['session name', 'student name', 'registered_for_programme', 'checked_in', 'bus', 'checked_in_at', 'checked_in_by'],
+      ...students.map((student) => {
+        const record = checkedByStudent.get(student.id)
+        return [
+          activeOrSelectedSession.name,
+          student.name,
+          String(student.registered_for_programme),
+          String(Boolean(record)),
+          record?.bus_label_snapshot ?? '',
+          record?.checked_in_at ?? '',
+          record?.checked_in_by_name ?? '',
+        ]
+      }),
+    ]
+
+    const csv = rows.map((row) => row.map((cell) => `"${cell.replace(/"/g, '""')}"`).join(',')).join('\n')
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `${activeOrSelectedSession.name.replace(/\s+/g, '-').toLowerCase()}-attendance.csv`
+    link.click()
+    URL.revokeObjectURL(url)
+  }
+
+  const renderPublicCheckIn = () => {
+    if (!publicPayload) {
+      return (
+        <main className="app-shell compact-shell">
+          <div className="panel centered-panel">
+            <h1>Loading check-in link</h1>
+            <p className="muted">Validating the session token...</p>
+          </div>
+        </main>
+      )
+    }
+
+    const isClosed = publicPayload.session.status === 'closed'
+    const activeBuses = publicPayload.buses.filter((bus) => bus.active)
+
+    return (
+      <main className="app-shell">
+        <section className="hero-card operations-hero">
+          <div>
+            <p className="eyebrow">Bus check-in</p>
+            <h1>{publicPayload.group.name}</h1>
+            <p className="hero-description">{publicPayload.session.name}</p>
+          </div>
+          <div className="hero-actions">
+            <span className={`status-chip ${isClosed ? 'closed' : 'open'}`}>{isClosed ? 'Closed' : 'Open'}</span>
+            <button type="button" className="secondary-button" onClick={() => refreshPublicSession()} disabled={publicLoading}>
+              Refresh
             </button>
+            <p className="muted small-text">Last updated {lastUpdated ? lastUpdated.toLocaleTimeString() : 'never'}</p>
           </div>
-        ) : null}
-      </div>
+        </section>
 
-      {page === 'home' ? (
-        <div className="content-grid home-grid">
-          <div className="action-card" onClick={() => setPage('manage')}>
-            <h2>Add / Reset</h2>
-            <p>Import roster via CSV, manually add students, or reset attendance.</p>
-          </div>
-          <div className="action-card" onClick={() => setPage('search')}>
-            <h2>Search / Tick Off</h2>
-            <p>Find students and mark them present on the current bus.</p>
-          </div>
-          <div className="action-card" onClick={() => setPage('stats')}>
-            <h2>View Statistics</h2>
-            <p>See attendance totals and manually added names.</p>
-          </div>
-        </div>
-      ) : page === 'manage' ? (
-        <div className="content-grid">
-          <aside className="sidebar">
-            <div className="panel csv-panel">
-              <div className="section-header">
-                <div>
-                  <p className="eyebrow">Import</p>
-                  <h2>Load roster from CSV</h2>
-                </div>
-                <p className="section-note">Upload names to add students without checking them in.</p>
-              </div>
+        {notice ? <div className={`toast ${notice.type}`}>{notice.message}</div> : null}
 
-              <label className="file-label">
-                <input
-                  type="file"
-                  accept=".csv,text/csv"
-                  onChange={(event) => handleCsvUpload(event.target.files?.[0] ?? null)}
-                />
-                Choose CSV file
-              </label>
-              <p className="csv-help">First column should contain names. Existing names are skipped.</p>
-            </div>
-
-            <div className="panel add-panel">
-              <div className="section-header">
-                <div>
-                  <p className="eyebrow">Manual add</p>
-                  <h2>Add a student</h2>
-                </div>
-                <p className="section-note">Add a student to the roster before boarding.</p>
-              </div>
-
-              <label htmlFor="manual-add" className="sr-only">
-                Add student name
-              </label>
-              <input
-                id="manual-add"
-                value={manualAddName}
-                onChange={(event) => setManualAddName(event.target.value)}
-                className="search-input"
-                placeholder="Type a student name"
-              />
-              <button
-                type="button"
-                className="add-button"
-                onClick={() => handleManualAddStudent(manualAddName)}
-                disabled={!manualAddName.trim() || loading}
-              >
-                Add student
+        {!helperName && !isClosed ? (
+          <section className="panel helper-panel">
+            <h2>Your name / bus helper name</h2>
+            <div className="inline-form">
+              <input value={helperNameDraft} onChange={(event) => setHelperNameDraft(event.target.value)} placeholder="e.g. Sarah at Bus 1" />
+              <button type="button" className="primary-button" onClick={saveHelperName} disabled={!helperNameDraft.trim()}>
+                Start checking in
               </button>
             </div>
+          </section>
+        ) : null}
 
-            <button type="button" className="reset-button" onClick={handleResetAttendance}>
-              Reset attendance
-            </button>
-          </aside>
+        <StatsGrid stats={publicStats} />
 
-          <main className="main-content">
-            {error ? <div className="toast error">{error}</div> : null}
-
-            <StudentSearch
-              query={searchQuery}
-              onQueryChange={setSearchQuery}
-              suggestions={suggestions}
-              onSelectSuggestion={handleSelectSuggestion}
-              selectedBus={selectedBus}
-              allowAdd={false}
-            />
-          </main>
-        </div>
-      ) : page === 'search' ? (
-        <div className="content-grid">
-          <aside className="sidebar">
-            <div className="bus-info-card">
-              <p className="bus-info-label">Current bus</p>
-              <strong>Bus {selectedBus}</strong>
-              <p className="bus-tip">
-                Any student can board any bus. A student is assigned to the current bus only when checked in.
-              </p>
-            </div>
-          </aside>
-
-          <main className="main-content">
-            {error ? <div className="toast error">{error}</div> : null}
-
-            <div className="panel summary-panel">
-              <div className="section-header">
-                <div>
-                  <p className="eyebrow">Routing</p>
-                  <h2>Switch buses</h2>
-                </div>
-                <p className="section-note">Choose which bus you're currently working on.</p>
+        <section className="checkin-layout">
+          <aside className="panel sticky-tools">
+            <h2>Bus controls</h2>
+            <label>
+              Check-in bus
+              <select value={selectedPublicBusId} onChange={(event) => setPublicBus(event.target.value)} disabled={isClosed}>
+                <option value="">Choose bus</option>
+                {activeBuses.map((bus) => (
+                  <option key={bus.id} value={bus.id}>
+                    {bus.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              View filter
+              <select value={publicBusFilterId} onChange={(event) => setPublicBusFilterId(event.target.value as UUID | 'all')}>
+                <option value="all">All buses</option>
+                {publicPayload.buses.map((bus) => (
+                  <option key={bus.id} value={bus.id}>
+                    {bus.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {!isClosed ? (
+              <div className="walkon-box">
+                <h3>Add walk-on</h3>
+                <input value={walkOnName} onChange={(event) => setWalkOnName(event.target.value)} placeholder="Unregistered student name" />
+                <button type="button" className="secondary-button" onClick={addWalkOn} disabled={!walkOnName.trim() || !helperName}>
+                  Add and check in
+                </button>
               </div>
+            ) : null}
+          </aside>
 
-              <BusSelector
-                buses={busNumbers}
-                selectedBus={selectedBus}
-                onChange={setSelectedBus}
+          <section className="panel">
+            <div className="section-title-row">
+              <div>
+                <p className="eyebrow">Roster</p>
+                <h2>{isClosed ? 'Read-only session summary' : 'Search and check in'}</h2>
+              </div>
+              <input
+                className="search-input"
+                value={publicSearch}
+                onChange={(event) => setPublicSearch(event.target.value)}
+                placeholder="Search every student"
               />
             </div>
 
-            <StudentSearch
-              query={searchQuery}
-              onQueryChange={setSearchQuery}
-              suggestions={suggestions}
-              onSelectSuggestion={handleSelectSuggestion}
-              onAddNew={(name) => handleManualAddStudent(name, {
-                clearSearch: true,
-                checkedIn: true,
-                busNumber: selectedBus,
-              })}
-              canAddNew={canAddNewStudent}
-              selectedBus={selectedBus}
-              allowAdd={true}
+            <StudentRows
+              students={publicVisibleStudents}
+              records={publicPayload.attendance}
+              buses={publicPayload.buses}
+              selectedBusId={selectedPublicBusId}
+              disabled={isClosed || !helperName}
+              onCheckIn={(studentId) => publicCheckIn(studentId)}
+              onCheckOut={publicCheckOut}
             />
+          </section>
+        </section>
 
-            <AttendanceList
-              students={pendingStudents}
-              onToggleChecked={handleToggleStudent}
-              loading={loading}
-            />
-          </main>
+        {pendingOverride ? (
+          <div className="modal-backdrop">
+            <div className="modal">
+              <h2>Move student?</h2>
+              <p>
+                This student is already checked in on {pendingOverride.conflict.current_bus_label}. Move them to{' '}
+                {pendingOverride.conflict.requested_bus_label}?
+              </p>
+              <div className="modal-actions">
+                <button type="button" className="secondary-button" onClick={() => setPendingOverride(null)}>
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  className="primary-button"
+                  onClick={async () => {
+                    const override = pendingOverride
+                    setPendingOverride(null)
+                    await publicCheckIn(override.studentId, true)
+                  }}
+                >
+                  Move student
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
+      </main>
+    )
+  }
+
+  if (isPublicLink) return renderPublicCheckIn()
+
+  return (
+    <main className="app-shell">
+      <section className="hero-card">
+        <div>
+          <p className="eyebrow">Camp operations</p>
+          <h1>Bus Role Call</h1>
+          <p className="hero-description">
+            Manage programme rosters, buses, live check-ins, locked session summaries, and bus-count exports.
+          </p>
         </div>
-      ) : (
-        <div className="content-grid stats-grid">
-          <main className="main-content">
-            {error ? <div className="toast error">{error}</div> : null}
-            <SummaryView
-              checkedIn={summaryCheckedIn}
-              notCheckedIn={summaryNotCheckedIn}
-              addedUsers={summaryAdded}
-            />
-          </main>
+        <div className="home-actions">
+          <a className="primary-link" href="#admin">
+            Admin login / create programme
+          </a>
+          <p className="muted">Helpers should open the public check-in link shared by the programme admin.</p>
         </div>
-      )}
+      </section>
+
+      {notice ? <div className={`toast ${notice.type}`}>{notice.message}</div> : null}
+
+      <section id="admin" className="panel auth-card">
+        <div>
+          <p className="eyebrow">Admin</p>
+          <h2>{user ? 'Programme dashboard' : 'Sign in to manage programmes'}</h2>
+        </div>
+        {user ? (
+          <div className="auth-row">
+            <span>{user.email ?? user.id}</span>
+            <button type="button" className="secondary-button" onClick={signOut}>
+              Sign out
+            </button>
+          </div>
+        ) : (
+          <div className="inline-form">
+            <input type="email" value={authEmail} onChange={(event) => setAuthEmail(event.target.value)} placeholder="you@example.com" />
+            <button type="button" className="primary-button" onClick={signIn} disabled={loading || !authEmail.trim()}>
+              Send magic link
+            </button>
+          </div>
+        )}
+      </section>
+
+      {user ? (
+        <section className="admin-grid">
+          <aside className="panel admin-sidebar">
+            <h2>Programmes</h2>
+            <select value={selectedGroupId ?? ''} onChange={(event) => setSelectedGroupId(event.target.value || null)}>
+              <option value="">Select programme</option>
+              {groups.map((group) => (
+                <option key={group.id} value={group.id}>
+                  {group.name}
+                </option>
+              ))}
+            </select>
+            <div className="stacked-form">
+              <input value={newGroupName} onChange={(event) => setNewGroupName(event.target.value)} placeholder="Grade 7 Shabbaton 2026" />
+              <button type="button" className="primary-button" onClick={createGroup} disabled={!newGroupName.trim()}>
+                Create programme
+              </button>
+            </div>
+            {selectedGroup ? <p className="muted">Group code: {selectedGroup.group_code}</p> : <p className="empty-state">No groups yet.</p>}
+          </aside>
+
+          <section className="admin-main">
+            <div className="tabs">
+              {(['dashboard', 'roster', 'buses', 'sessions'] as AdminTab[]).map((tab) => (
+                <button key={tab} type="button" className={adminTab === tab ? 'active' : ''} onClick={() => setAdminTab(tab)}>
+                  {tab}
+                </button>
+              ))}
+            </div>
+
+            {!selectedGroup ? (
+              <div className="panel empty-state">Create or select a programme to begin.</div>
+            ) : adminTab === 'dashboard' ? (
+              <DashboardPanel
+                group={selectedGroup}
+                session={activeOrSelectedSession}
+                buses={buses}
+                students={students}
+                records={records}
+                stats={adminStats}
+                onCopySummary={copyWhatsAppSummary}
+                onDownloadCsv={downloadCsv}
+              />
+            ) : adminTab === 'roster' ? (
+              <section className="panel">
+                <div className="section-title-row">
+                  <div>
+                    <p className="eyebrow">Roster</p>
+                    <h2>Students and walk-ons</h2>
+                  </div>
+                  <label className="file-label">
+                    Import CSV
+                    <input type="file" accept=".csv,text/csv" onChange={(event) => void importCsv(event.target.files?.[0] ?? null)} />
+                  </label>
+                </div>
+                <div className="inline-form">
+                  <input value={newStudentName} onChange={(event) => setNewStudentName(event.target.value)} placeholder="Student name" />
+                  <label className="checkbox-label">
+                    <input
+                      type="checkbox"
+                      checked={newStudentRegistered}
+                      onChange={(event) => setNewStudentRegistered(event.target.checked)}
+                    />
+                    Registered
+                  </label>
+                  <button type="button" className="primary-button" onClick={addStudent} disabled={!newStudentName.trim()}>
+                    Add
+                  </button>
+                </div>
+                <RosterTable students={students} onRemove={removeStudent} />
+              </section>
+            ) : adminTab === 'buses' ? (
+              <section className="panel">
+                <div className="section-title-row">
+                  <div>
+                    <p className="eyebrow">Buses</p>
+                    <h2>Manage bus labels</h2>
+                  </div>
+                  <div className="inline-form compact-form">
+                    <input value={newBusLabel} onChange={(event) => setNewBusLabel(event.target.value)} placeholder="Bus 1" />
+                    <button type="button" className="primary-button" onClick={addBus} disabled={!newBusLabel.trim()}>
+                      Add bus
+                    </button>
+                  </div>
+                </div>
+                <BusTable buses={buses} onToggle={toggleBusActive} onDelete={deleteOrDeactivateBus} />
+              </section>
+            ) : (
+              <section className="panel">
+                <div className="section-title-row">
+                  <div>
+                    <p className="eyebrow">Sessions</p>
+                    <h2>Start, share, reset, close</h2>
+                  </div>
+                  <div className="inline-form compact-form">
+                    <input value={newSessionName} onChange={(event) => setNewSessionName(event.target.value)} placeholder="Departure" />
+                    <button type="button" className="primary-button" onClick={startSession} disabled={Boolean(activeSession)}>
+                      Start session
+                    </button>
+                  </div>
+                </div>
+                <div className="session-actions">
+                  <button type="button" className="secondary-button" onClick={resetSession} disabled={activeOrSelectedSession?.status !== 'open'}>
+                    Reset selected open session
+                  </button>
+                  <button type="button" className="danger-button" onClick={endSession} disabled={activeOrSelectedSession?.status !== 'open'}>
+                    End selected session
+                  </button>
+                </div>
+                <SessionTable
+                  sessions={sessions}
+                  selectedSessionId={selectedSessionId}
+                  onSelect={setSelectedSessionId}
+                  onCopyLink={copySessionLink}
+                />
+              </section>
+            )}
+          </section>
+        </section>
+      ) : null}
+
+      <ConfirmModal dialog={confirmDialog} onClose={() => setConfirmDialog(null)} />
+    </main>
+  )
+}
+
+interface StatsGridProps {
+  stats: SessionStats
+}
+
+function StatsGrid({ stats }: StatsGridProps) {
+  return (
+    <section className="stats-grid">
+      <article className="stat-card">
+        <span>Total registered</span>
+        <strong>{stats.totalRegistered}</strong>
+      </article>
+      <article className="stat-card">
+        <span>Checked in</span>
+        <strong>{stats.checkedInRegistered}</strong>
+      </article>
+      <article className="stat-card">
+        <span>Missing</span>
+        <strong>{stats.missingRegistered}</strong>
+      </article>
+      <article className="stat-card">
+        <span>Walk-ons checked in</span>
+        <strong>{stats.walkOnsCheckedIn}</strong>
+      </article>
+    </section>
+  )
+}
+
+interface StudentRowsProps {
+  students: Student[]
+  records: AttendanceRecord[]
+  buses: Bus[]
+  selectedBusId: UUID | ''
+  disabled: boolean
+  onCheckIn: (studentId: UUID) => void
+  onCheckOut: (studentId: UUID) => void
+}
+
+function StudentRows({ students, records, buses, selectedBusId, disabled, onCheckIn, onCheckOut }: StudentRowsProps) {
+  const busById = new Map(buses.map((bus) => [bus.id, bus]))
+
+  if (students.length === 0) return <div className="empty-state">No students match this view.</div>
+
+  return (
+    <ul className="student-list">
+      {students.map((student) => {
+        const record = getRecordForStudent(records, student.id)
+        const targetBus = selectedBusId ? busById.get(selectedBusId)?.label : null
+        return (
+          <li key={student.id} className="student-row">
+            <div>
+              <strong>{student.name}</strong>
+              <p className="muted small-text">
+                {student.registered_for_programme ? 'Registered' : 'Walk-on'}
+                {record ? ` · Checked in on ${record.bus_label_snapshot}` : ' · Missing'}
+              </p>
+            </div>
+            <div className="row-actions">
+              {record ? (
+                <>
+                  {selectedBusId && record.bus_id !== selectedBusId ? (
+                    <button type="button" className="secondary-button" onClick={() => onCheckIn(student.id)} disabled={disabled}>
+                      Move to {targetBus}
+                    </button>
+                  ) : null}
+                  <button type="button" className="ghost-button" onClick={() => onCheckOut(student.id)} disabled={disabled}>
+                    Undo
+                  </button>
+                </>
+              ) : (
+                <button type="button" className="primary-button" onClick={() => onCheckIn(student.id)} disabled={disabled || !selectedBusId}>
+                  Check in
+                </button>
+              )}
+            </div>
+          </li>
+        )
+      })}
+    </ul>
+  )
+}
+
+interface DashboardPanelProps {
+  group: Group
+  session: AttendanceSession | null
+  buses: Bus[]
+  students: Student[]
+  records: AttendanceRecord[]
+  stats: SessionStats
+  onCopySummary: () => void
+  onDownloadCsv: () => void
+}
+
+function DashboardPanel({ group, session, buses, students, records, stats, onCopySummary, onDownloadCsv }: DashboardPanelProps) {
+  const checkedIds = new Set(records.map((record) => record.student_id))
+  const missing = students.filter((student) => student.registered_for_programme && !checkedIds.has(student.id))
+
+  return (
+    <section className="panel">
+      <div className="section-title-row">
+        <div>
+          <p className="eyebrow">Dashboard</p>
+          <h2>{group.name}</h2>
+        </div>
+        <span className={`status-chip ${session?.status === 'open' ? 'open' : 'closed'}`}>{session?.status ?? 'No session'}</span>
+      </div>
+      <StatsGrid stats={stats} />
+      <div className="dashboard-columns">
+        <div>
+          <h3>Per-bus counts</h3>
+          <ul className="summary-list">
+            {buses.map((bus) => (
+              <li key={bus.id}>
+                <span>{bus.label}</span>
+                <strong>{records.filter((record) => record.bus_id === bus.id).length}</strong>
+              </li>
+            ))}
+          </ul>
+        </div>
+        <div>
+          <h3>Missing registered students</h3>
+          <ul className="summary-list names">
+            {missing.slice(0, 30).map((student) => (
+              <li key={student.id}>{student.name}</li>
+            ))}
+          </ul>
+        </div>
+      </div>
+      <div className="session-actions">
+        <button type="button" className="secondary-button" onClick={onCopySummary} disabled={!session}>
+          Copy WhatsApp summary
+        </button>
+        <button type="button" className="secondary-button" onClick={onDownloadCsv} disabled={!session}>
+          Download CSV
+        </button>
+      </div>
+    </section>
+  )
+}
+
+function buildSummaryLines(
+  programmeName: string,
+  session: AttendanceSession,
+  buses: Bus[],
+  students: Student[],
+  records: AttendanceRecord[]
+) {
+  const stats = buildStats(students, records)
+  const checkedIds = new Set(records.map((record) => record.student_id))
+  const missing = students.filter((student) => student.registered_for_programme && !checkedIds.has(student.id))
+
+  return [
+    `Programme: ${programmeName}`,
+    `Session: ${session.name}`,
+    `Status: ${session.status}`,
+    `Total registered: ${stats.totalRegistered}`,
+    `Checked in: ${stats.checkedInRegistered}`,
+    `Missing: ${stats.missingRegistered}`,
+    'Bus counts:',
+    ...buses.map((bus) => `- ${bus.label}: ${records.filter((record) => record.bus_id === bus.id).length}`),
+    `Unregistered/walk-ons: ${stats.walkOnsCheckedIn}`,
+    'Missing:',
+    ...(missing.length ? missing.map((student) => `- ${student.name}`) : ['- None']),
+  ]
+}
+
+interface RosterTableProps {
+  students: Student[]
+  onRemove: (student: Student) => void
+}
+
+function RosterTable({ students, onRemove }: RosterTableProps) {
+  if (students.length === 0) return <div className="empty-state">No students yet. Import a CSV or add names manually.</div>
+  return (
+    <div className="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Status</th>
+            <th>Added</th>
+            <th />
+          </tr>
+        </thead>
+        <tbody>
+          {students.map((student) => (
+            <tr key={student.id}>
+              <td>{student.name}</td>
+              <td>{student.registered_for_programme ? 'Registered' : 'Walk-on'}</td>
+              <td>{formatDateTime(student.created_at)}</td>
+              <td>
+                <button type="button" className="ghost-button" onClick={() => onRemove(student)}>
+                  Remove
+                </button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+interface BusTableProps {
+  buses: Bus[]
+  onToggle: (bus: Bus) => void
+  onDelete: (bus: Bus) => void
+}
+
+function BusTable({ buses, onToggle, onDelete }: BusTableProps) {
+  if (buses.length === 0) return <div className="empty-state">No buses yet. Add at least one bus before sharing check-in links.</div>
+  return (
+    <div className="card-list">
+      {buses.map((bus) => (
+        <article key={bus.id} className="mini-card">
+          <div>
+            <strong>{bus.label}</strong>
+            <p className="muted">{bus.active ? 'Active' : 'Inactive'}</p>
+          </div>
+          <div className="row-actions">
+            <button type="button" className="secondary-button" onClick={() => onToggle(bus)}>
+              {bus.active ? 'Deactivate' : 'Reactivate'}
+            </button>
+            <button type="button" className="ghost-button" onClick={() => onDelete(bus)}>
+              Delete
+            </button>
+          </div>
+        </article>
+      ))}
+    </div>
+  )
+}
+
+interface SessionTableProps {
+  sessions: AttendanceSession[]
+  selectedSessionId: UUID | null
+  onSelect: (sessionId: UUID) => void
+  onCopyLink: (session: AttendanceSession) => void
+}
+
+function SessionTable({ sessions, selectedSessionId, onSelect, onCopyLink }: SessionTableProps) {
+  if (sessions.length === 0) return <div className="empty-state">No sessions yet. Start one when buses are ready.</div>
+  return (
+    <div className="card-list">
+      {sessions.map((session) => (
+        <article key={session.id} className={`mini-card ${selectedSessionId === session.id ? 'selected' : ''}`}>
+          <div>
+            <strong>{session.name}</strong>
+            <p className="muted">
+              {session.status} · Started {formatDateTime(session.started_at)}
+              {session.ended_at ? ` · Ended ${formatDateTime(session.ended_at)}` : ''}
+            </p>
+          </div>
+          <div className="row-actions">
+            <button type="button" className="secondary-button" onClick={() => onSelect(session.id)}>
+              View
+            </button>
+            <button type="button" className="primary-button" onClick={() => onCopyLink(session)} disabled={session.status !== 'open'}>
+              Copy link
+            </button>
+          </div>
+        </article>
+      ))}
+    </div>
+  )
+}
+
+interface ConfirmModalProps {
+  dialog: ConfirmDialog
+  onClose: () => void
+}
+
+function ConfirmModal({ dialog, onClose }: ConfirmModalProps) {
+  if (!dialog) return null
+  return (
+    <div className="modal-backdrop">
+      <div className="modal">
+        <h2>{dialog.title}</h2>
+        <p>{dialog.message}</p>
+        <div className="modal-actions">
+          <button type="button" className="secondary-button" onClick={onClose}>
+            Cancel
+          </button>
+          <button
+            type="button"
+            className={dialog.danger ? 'danger-button' : 'primary-button'}
+            onClick={async () => {
+              await dialog.onConfirm()
+              onClose()
+            }}
+          >
+            {dialog.confirmLabel}
+          </button>
+        </div>
+      </div>
     </div>
   )
 }
