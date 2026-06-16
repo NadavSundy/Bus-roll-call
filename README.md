@@ -6,7 +6,7 @@ The app models a programme as a group with one roster, multiple buses, and multi
 
 ## Features
 
-- Supabase magic-link admin login
+- Supabase email/password admin login, account creation, and password reset
 - Programme/group dashboard
 - CSV roster import with duplicate normalized-name skipping
 - Manual registered student and walk-on support
@@ -29,6 +29,7 @@ The app models a programme as a group with one roster, multiple buses, and multi
 ```bash
 VITE_SUPABASE_URL=https://your-supabase-project-ref.supabase.co
 VITE_SUPABASE_ANON_KEY=your-anon-public-key
+VITE_APP_URL=https://your-production-app-url.com
 ```
 
 4. Install dependencies:
@@ -74,6 +75,26 @@ Anonymous helpers do not get broad table access. Public check-in screens call on
 - `public_add_walk_on_student(session_id, public_checkin_token, name, bus_id, helper_name)`
 
 The RPCs validate the session token, open/closed status, student ownership, bus ownership, active bus status, and helper name. Writes are handled in the database so race conditions are controlled by constraints and row locks.
+
+## Auth Email Setup
+
+The app uses Supabase Auth for user accounts, passwords, email confirmation, and password reset emails.
+
+To send auth emails through Gmail, configure Supabase Custom SMTP in the Supabase dashboard. Do not put Gmail SMTP credentials, Gmail passwords, or SMTP app passwords in frontend code, `.env`, `.env.example`, or committed files.
+
+For Gmail SMTP, Google requires 2-Step Verification and an App Password.
+
+In Supabase Auth URL Configuration:
+
+- Set Site URL to your production app URL.
+- Add redirect URLs for production and local Vite dev:
+  - `https://your-production-app-url.com/**`
+  - `http://localhost:5173/**`
+
+Set `VITE_APP_URL` in `.env` and in deployment environment variables. The app uses it for auth email redirects:
+
+- Account confirmation: `${VITE_APP_URL}/auth/callback`
+- Password reset: `${VITE_APP_URL}/auth/reset-password`
 
 ## Day-Of Use
 
@@ -122,3 +143,4 @@ Build the production site and publish `dist`. The existing GitHub Pages workflow
 
 - `VITE_SUPABASE_URL`
 - `VITE_SUPABASE_ANON_KEY`
+- `VITE_APP_URL`

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import Fuse from 'fuse.js'
 import { hasSupabaseConfig, supabase } from './lib/supabase'
 import { generateGroupCode } from './lib/groupCode'
+import AuthPanel, { type AuthMode } from './components/AuthPanel'
 import type {
   AttendanceRecord,
   AttendanceSession,
@@ -77,11 +78,12 @@ function App() {
   const initialSessionId = urlParams.get('sessionId')
   const initialToken = urlParams.get('token')
   const isPublicLink = Boolean(initialSessionId && initialToken)
+  const isResetPasswordPath = window.location.pathname === '/auth/reset-password'
   const initialHelperName =
     isPublicLink && initialSessionId ? window.localStorage.getItem(`bus-role-call:${initialSessionId}:helper`) ?? '' : ''
 
   const [user, setUser] = useState<UserProfile | null>(null)
-  const [authEmail, setAuthEmail] = useState('')
+  const [authMode, setAuthMode] = useState<AuthMode>(isResetPasswordPath ? 'set-new-password' : 'sign-in')
   const [notice, setNotice] = useState<Notice>(null)
   const [confirmDialog, setConfirmDialog] = useState<ConfirmDialog>(null)
   const [loading, setLoading] = useState(false)
@@ -264,7 +266,11 @@ function App() {
   useEffect(() => {
     void Promise.resolve().then(loadAuth)
 
-    const { data } = supabase.auth.onAuthStateChange((_event, session) => {
+    const { data } = supabase.auth.onAuthStateChange((event, session) => {
+      if (event === 'PASSWORD_RECOVERY') {
+        setAuthMode('set-new-password')
+      }
+
       const profile = session?.user
       setUser(profile ? { id: profile.id, email: profile.email ?? null } : null)
     })
@@ -330,21 +336,6 @@ function App() {
       void supabase.removeChannel(channel)
     }
   }, [loadAdminData, loadAdminRecords, selectedGroupId, selectedSessionId, user])
-
-  const signIn = async () => {
-    if (!ensureSupabaseConfig()) return
-    const email = authEmail.trim()
-    if (!email) {
-      showNotice('error', 'Enter your email address.')
-      return
-    }
-
-    setLoading(true)
-    const { error } = await supabase.auth.signInWithOtp({ email })
-    setLoading(false)
-    if (error) showNotice('error', error.message)
-    else showNotice('success', 'Check your inbox for the magic link.')
-  }
 
   const signOut = async () => {
     await supabase.auth.signOut()
@@ -839,36 +830,30 @@ function App() {
           </p>
         </div>
         <div className="home-actions">
-          <a className="primary-link" href="#admin">
-            Admin login / create programme
-          </a>
-          <p className="muted">Helpers should open the public check-in link shared by the programme admin.</p>
+          <div className="home-action-card">
+            <strong>Join existing group / check in students</strong>
+            <p className="muted">Open the public check-in link shared by the programme admin.</p>
+          </div>
+          <div className="home-action-card">
+            <strong>Admin sign in / create account</strong>
+            <p className="muted">Use the account form below to manage programmes.</p>
+          </div>
         </div>
       </section>
 
       {notice ? <div className={`toast ${notice.type}`}>{notice.message}</div> : null}
 
-      <section id="admin" className="panel auth-card">
-        <div>
-          <p className="eyebrow">Admin</p>
-          <h2>{user ? 'Programme dashboard' : 'Sign in to manage programmes'}</h2>
-        </div>
-        {user ? (
-          <div className="auth-row">
-            <span>{user.email ?? user.id}</span>
-            <button type="button" className="secondary-button" onClick={signOut}>
-              Sign out
-            </button>
-          </div>
-        ) : (
-          <div className="inline-form">
-            <input type="email" value={authEmail} onChange={(event) => setAuthEmail(event.target.value)} placeholder="you@example.com" />
-            <button type="button" className="primary-button" onClick={signIn} disabled={loading || !authEmail.trim()}>
-              Send magic link
-            </button>
-          </div>
-        )}
-      </section>
+      <AuthPanel
+        user={user}
+        mode={authMode}
+        onModeChange={setAuthMode}
+        onAuthChanged={(message) => {
+          if (message) showNotice('success', message)
+          void loadAuth()
+        }}
+        onSignOut={signOut}
+        loading={loading}
+      />
 
       {user ? (
         <section className="admin-grid">

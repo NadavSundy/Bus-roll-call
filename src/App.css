@@ -93,6 +93,19 @@
   align-items: center;
 }
 
+.home-action-card {
+  width: min(100%, 320px);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 14px;
+  background: #fbfbfb;
+}
+
+.home-action-card strong {
+  display: block;
+  color: var(--text);
+}
+
 .hero-actions {
   align-content: start;
 }
@@ -204,6 +217,45 @@ select:focus {
 .checkin-layout,
 .stats-grid {
   margin-top: 18px;
+}
+
+.auth-panel {
+  display: grid;
+  gap: 16px;
+}
+
+.auth-panel-header {
+  display: grid;
+  gap: 12px;
+}
+
+.auth-mode-tabs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.auth-mode-tabs button,
+.text-button {
+  min-height: 40px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--blue-active);
+  font-weight: 800;
+}
+
+.auth-mode-tabs button.active {
+  background: var(--blue);
+  border-color: var(--blue);
+  color: #fff;
+}
+
+.text-button {
+  border: none;
+  background: transparent;
+  text-align: left;
+  padding: 0;
 }
 
 .admin-grid,
