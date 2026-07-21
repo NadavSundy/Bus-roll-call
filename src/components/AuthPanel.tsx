@@ -75,7 +75,7 @@ const AuthPanel: FC<AuthPanelProps> = ({ user, mode, onModeChange, onAuthChanged
       const passwordError = validatePassword()
       if (passwordError) throw new Error(passwordError)
 
-      const { error: signUpError } = await supabase.auth.signUp({
+      const { data: signUpData, error: signUpError } = await supabase.auth.signUp({
         email: cleanEmail,
         password,
         options: {
@@ -84,8 +84,25 @@ const AuthPanel: FC<AuthPanelProps> = ({ user, mode, onModeChange, onAuthChanged
       })
 
       if (signUpError) throw signUpError
+
+      if (!signUpData.session) {
+        const { error: signInAfterSignUpError } = await supabase.auth.signInWithPassword({
+          email: cleanEmail,
+          password,
+        })
+
+        if (signInAfterSignUpError) {
+          const message = signInAfterSignUpError.message.toLowerCase()
+          if (message.includes('confirm') || message.includes('verified')) {
+            throw new Error('Supabase is still requiring email confirmation. Disable email confirmations in Supabase Auth settings for now.')
+          }
+
+          throw signInAfterSignUpError
+        }
+      }
+
       changeMode('sign-in')
-      return 'Account created. Check your email if confirmation is required.'
+      return 'Account created. You are signed in.'
     })
 
   const signIn = () =>

@@ -80,6 +80,12 @@ The RPCs validate the session token, open/closed status, student ownership, bus 
 
 The app uses Supabase Auth for user accounts, passwords, email confirmation, and password reset emails.
 
+For now, disable required account verification in the Supabase dashboard so newly created admins can sign in immediately:
+
+- Go to Authentication > Providers > Email.
+- Turn off required email confirmation / confirmation email for sign-ups.
+- Save the provider settings.
+
 To send auth emails through Gmail, configure Supabase Custom SMTP in the Supabase dashboard. Do not put Gmail SMTP credentials, Gmail passwords, or SMTP app passwords in frontend code, `.env`, `.env.example`, or committed files.
 
 For Gmail SMTP, Google requires 2-Step Verification and an App Password.
