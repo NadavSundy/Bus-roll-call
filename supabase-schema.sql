@@ -17,6 +17,7 @@ drop function if exists current_user_group_role(uuid) cascade;
 drop function if exists is_group_member(uuid) cascade;
 drop function if exists is_group_admin(uuid) cascade;
 drop function if exists get_group_by_code(text) cascade;
+drop function if exists create_group_with_owner(text, text) cascade;
 drop function if exists public_get_session_for_checkin(uuid, text) cascade;
 drop function if exists public_check_in_student(uuid, text, uuid, uuid, text, boolean) cascade;
 drop function if exists public_check_out_student(uuid, text, uuid, text) cascade;
@@ -232,7 +233,7 @@ create policy groups_read_members on groups
 
 create policy groups_insert_authenticated on groups
   for insert to authenticated
-  with check (owner_id = auth.uid());
+  with check (owner_id = (select auth.uid()));
 
 create policy groups_update_admins on groups
   for update to authenticated
@@ -343,6 +344,42 @@ as $$
   where groups.group_code = upper(trim(group_code))
     and is_group_member(groups.id)
   limit 1;
+$$;
+
+create function create_group_with_owner(programme_name text, requested_group_code text)
+returns groups
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  created_group groups%rowtype;
+  clean_name text := trim(coalesce(programme_name, ''));
+  clean_code text := upper(trim(coalesce(requested_group_code, '')));
+  current_user_id uuid := auth.uid();
+begin
+  if current_user_id is null then
+    raise exception 'You must be signed in to create a programme.' using errcode = 'P0001';
+  end if;
+
+  if length(clean_name) < 1 or length(clean_name) > 160 then
+    raise exception 'Programme name is required and must be 160 characters or fewer.' using errcode = 'P0001';
+  end if;
+
+  if clean_code !~ '^[A-Z0-9]{6}$' then
+    raise exception 'Programme code must be exactly 6 letters or numbers.' using errcode = 'P0001';
+  end if;
+
+  insert into groups(name, group_code, owner_id)
+  values (clean_name, clean_code, current_user_id)
+  returning * into created_group;
+
+  insert into group_members(group_id, user_id, role)
+  values (created_group.id, current_user_id, 'owner')
+  on conflict (group_id, user_id) do update set role = 'owner';
+
+  return created_group;
+end;
 $$;
 
 create function public_get_session_for_checkin(session_id uuid, public_checkin_token text)
@@ -774,6 +811,7 @@ end;
 $$;
 
 grant execute on function get_group_by_code(text) to authenticated;
+grant execute on function create_group_with_owner(text, text) to authenticated;
 grant execute on function public_get_session_for_checkin(uuid, text) to anon, authenticated;
 grant execute on function public_check_in_student(uuid, text, uuid, uuid, text, boolean) to anon, authenticated;
 grant execute on function public_check_out_student(uuid, text, uuid, text) to anon, authenticated;
@@ -781,3 +819,5 @@ grant execute on function public_add_walk_on_student(uuid, text, text, uuid, tex
 grant execute on function admin_reset_open_session(uuid) to authenticated;
 grant execute on function admin_end_session(uuid) to authenticated;
 grant execute on function keepalive_ping() to anon, authenticated;
+
+grant select, insert, update on table groups to authenticated;

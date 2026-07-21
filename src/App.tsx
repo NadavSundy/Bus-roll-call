@@ -346,16 +346,24 @@ function App() {
   }
 
   const createGroup = async () => {
-    if (!ensureSupabaseConfig() || !user) return
+    if (!ensureSupabaseConfig()) return
     const name = newGroupName.trim()
     if (!name) return
 
     setLoading(true)
-    const { data, error } = await supabase
-      .from('groups')
-      .insert({ name, group_code: generateGroupCode(), owner_id: user.id })
-      .select()
-      .single()
+    const { data: authData, error: authError } = await supabase.auth.getUser()
+    const currentUser = authData.user
+
+    if (authError || !currentUser) {
+      setLoading(false)
+      showNotice('error', 'You must be signed in to create a programme.')
+      return
+    }
+
+    const { data, error } = await supabase.rpc('create_group_with_owner', {
+      programme_name: name,
+      requested_group_code: generateGroupCode(),
+    })
     setLoading(false)
 
     if (error) {
